@@ -51,8 +51,25 @@
 #include <velocypack/Slice.h>
 #include <velocypack/velocypack-aliases.h>
 
+#include <iostream>
+
 using namespace arangodb;
 using namespace arangodb::aql;
+
+struct time_guard{
+  double& dura;
+  double start;
+
+  time_guard(double& dur)
+    : dura(dur)
+    , start(TRI_microtime())
+    {
+      std::cout << "enter time_gurad" << std::endl;
+    };
+  ~time_guard(){
+    dura += TRI_microtime() - start;
+  }
+};
 
 using VelocyPackHelper = arangodb::basics::VelocyPackHelper;
 using StringBuffer = arangodb::basics::StringBuffer;
@@ -60,7 +77,7 @@ using StringBuffer = arangodb::basics::StringBuffer;
 GatherBlock::GatherBlock(ExecutionEngine* engine, GatherNode const* en)
     : ExecutionBlock(engine, en),
       _sortRegisters(),
-      _isSimple(en->getElements().empty()) {
+      _isSimple(en->getElements().empty()){
 
   if (!_isSimple) {
     for (auto const& p : en->getElements()) {
@@ -93,6 +110,7 @@ GatherBlock::~GatherBlock() {
 int GatherBlock::initialize() {
   DEBUG_BEGIN_BLOCK();
   _atDep = 0;
+  _odur = 0;
   return ExecutionBlock::initialize();
 
   // cppcheck-suppress style
@@ -102,6 +120,7 @@ int GatherBlock::initialize() {
 /// @brief shutdown: need our own method since our _buffer is different
 int GatherBlock::shutdown(int errorCode) {
   DEBUG_BEGIN_BLOCK();
+  //std::cerr << "####### time in GatherBlock::getsome: " << _odur << std::endl;
   // don't call default shutdown method since it does the wrong thing to
   // _gatherBlockBuffer
   int ret = TRI_ERROR_NO_ERROR;
@@ -241,9 +260,11 @@ bool GatherBlock::hasMore() {
 
 /// @brief getSome
 AqlItemBlock* GatherBlock::getSome(size_t atLeast, size_t atMost) {
+  std::size_t shardRequiredForHeapSort = 3;
   DEBUG_BEGIN_BLOCK();
   traceGetSomeBegin();
-     
+  //time_guard t(_odur);
+
   if (_dependencies.empty()) {
     _done = true;
   }
@@ -307,21 +328,35 @@ AqlItemBlock* GatherBlock::getSome(size_t atLeast, size_t atMost) {
 
   // comparison function
   OurLessThan ourLessThan(_trx, _gatherBlockBuffer, _sortRegisters);
+  auto ourGreater = [&ourLessThan](std::pair<std::size_t, std::size_t>& a
+                      ,std::pair<std::size_t, std::size_t>& b){
+    return ourLessThan(b,a);
+  };
+
   AqlItemBlock* example = _gatherBlockBuffer.at(index).front();
   size_t nrRegs = example->getNrRegs();
 
   // automatically deleted if things go wrong
   std::unique_ptr<AqlItemBlock> res(requestBlock(toSend, static_cast<arangodb::aql::RegisterId>(nrRegs)));
 
+  std::vector<std::pair<std::size_t, std::size_t>> heap;
+  if(_dependencies.size() > shardRequiredForHeapSort){
+    std::copy(_gatherBlockPos.begin(),_gatherBlockPos.end(),std::back_inserter(heap));
+    std::make_heap(heap.begin(), heap.end(),ourGreater);
+  }
+
   for (size_t i = 0; i < toSend; i++) {
     // get the next smallest row from the buffer . . .
-    std::pair<size_t, size_t> val = *(std::min_element(
-        _gatherBlockPos.begin(), _gatherBlockPos.end(), ourLessThan));
+  std::pair<size_t, size_t> val;
+  if(_dependencies.size() > shardRequiredForHeapSort){
+      val = heap.front();
+    } else {
+      val = *(std::min_element( _gatherBlockPos.begin(), _gatherBlockPos.end(), ourLessThan));
+    }
 
     // copy the row in to the outgoing block . . .
     for (RegisterId col = 0; col < nrRegs; col++) {
-      AqlValue const& x(
-          _gatherBlockBuffer.at(val.first).front()->getValue(val.second, col));
+      AqlValue const& x(_gatherBlockBuffer.at(val.first).front()->getValue(val.second, col));
       if (!x.isEmpty()) {
         auto it = cache.find(x);
 
@@ -340,14 +375,23 @@ AqlItemBlock* GatherBlock::getSome(size_t atLeast, size_t atMost) {
       }
     }
 
-    // renew the _gatherBlockPos and clean up the buffer if necessary
     _gatherBlockPos.at(val.first).second++;
-    if (_gatherBlockPos.at(val.first).second ==
-        _gatherBlockBuffer.at(val.first).front()->size()) {
+    if(_dependencies.size() > shardRequiredForHeapSort){
+      std::pop_heap(heap.begin(), heap.end(),ourGreater);
+      heap.back().second++;
+    }
+
+    // renew the _gatherBlockPos and clean up the buffer if necessary
+    if ( _gatherBlockPos.at(val.first).second == _gatherBlockBuffer.at(val.first).front()->size() ) {
       AqlItemBlock* cur = _gatherBlockBuffer.at(val.first).front();
       returnBlock(cur);
       _gatherBlockBuffer.at(val.first).pop_front();
-      _gatherBlockPos.at(val.first) = std::make_pair(val.first, 0);
+      //_gatherBlockPos.at(val.first).second = 0;
+      _gatherBlockPos.at(val.first) = {val.first, 0};
+
+      if( _dependencies.size() > shardRequiredForHeapSort) {
+        heap.back().second = 0;
+      }
 
       if (_gatherBlockBuffer.at(val.first).empty()) {
         // if we pulled everything from the buffer, we need to fetch
@@ -358,6 +402,10 @@ AqlItemBlock* GatherBlock::getSome(size_t atLeast, size_t atMost) {
         // a problem, because the sort function used takes care of
         // this
       }
+    }
+
+    if( _dependencies.size() > shardRequiredForHeapSort) {
+      std::push_heap(heap.begin(), heap.end(),ourGreater);
     }
   }
 

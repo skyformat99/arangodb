@@ -117,6 +117,7 @@ class GatherBlock : public ExecutionBlock {
     std::vector<std::deque<AqlItemBlock*>>& _gatherBlockBuffer;
     std::vector<SortElementBlock>& _sortRegisters;
   };
+  double _odur;
 };
 
 class BlockWithClients : public ExecutionBlock {
