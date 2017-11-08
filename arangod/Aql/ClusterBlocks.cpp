@@ -339,17 +339,18 @@ AqlItemBlock* GatherBlock::getSome(size_t atLeast, size_t atMost) {
   // automatically deleted if things go wrong
   std::unique_ptr<AqlItemBlock> res(requestBlock(toSend, static_cast<arangodb::aql::RegisterId>(nrRegs)));
 
-  std::vector<std::pair<std::size_t, std::size_t>> heap;
-  if(_dependencies.size() > shardRequiredForHeapSort){
+  if (!_heap && _dependencies.size() > shardRequiredForHeapSort){
+    _heap.reset(new Heap);
+    auto& heap = *_heap;
     std::copy(_gatherBlockPos.begin(),_gatherBlockPos.end(),std::back_inserter(heap));
     std::make_heap(heap.begin(), heap.end(),ourGreater);
   }
 
   for (size_t i = 0; i < toSend; i++) {
     // get the next smallest row from the buffer . . .
-  std::pair<size_t, size_t> val;
-  if(_dependencies.size() > shardRequiredForHeapSort){
-      val = heap.front();
+    std::pair<size_t, size_t> val;
+    if(_heap){
+      val = _heap->front();
     } else {
       val = *(std::min_element( _gatherBlockPos.begin(), _gatherBlockPos.end(), ourLessThan));
     }
@@ -376,7 +377,8 @@ AqlItemBlock* GatherBlock::getSome(size_t atLeast, size_t atMost) {
     }
 
     _gatherBlockPos.at(val.first).second++;
-    if(_dependencies.size() > shardRequiredForHeapSort){
+    if(_heap){
+      auto& heap = *_heap;
       std::pop_heap(heap.begin(), heap.end(),ourGreater);
       heap.back().second++;
     }
@@ -389,8 +391,8 @@ AqlItemBlock* GatherBlock::getSome(size_t atLeast, size_t atMost) {
       //_gatherBlockPos.at(val.first).second = 0;
       _gatherBlockPos.at(val.first) = {val.first, 0};
 
-      if( _dependencies.size() > shardRequiredForHeapSort) {
-        heap.back().second = 0;
+      if( _heap) {
+        _heap->back().second = 0;
       }
 
       if (_gatherBlockBuffer.at(val.first).empty()) {
@@ -405,7 +407,7 @@ AqlItemBlock* GatherBlock::getSome(size_t atLeast, size_t atMost) {
     }
 
     if( _dependencies.size() > shardRequiredForHeapSort) {
-      std::push_heap(heap.begin(), heap.end(),ourGreater);
+      std::push_heap(_heap->begin(), _heap->end(),ourGreater);
     }
   }
 

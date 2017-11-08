@@ -118,6 +118,8 @@ class GatherBlock : public ExecutionBlock {
     std::vector<SortElementBlock>& _sortRegisters;
   };
   double _odur;
+  using Heap = std::vector<std::pair<std::size_t,std::size_t>>;
+  std::unique_ptr<Heap> _heap;
 };
 
 class BlockWithClients : public ExecutionBlock {
